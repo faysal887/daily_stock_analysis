@@ -14,6 +14,7 @@ from api.v1.schemas.common import (
     ErrorResponse,
     SuccessResponse,
 )
+from api.v1.schemas.market_phase import MarketPhaseSummary
 from api.v1.schemas.analysis import (
     AnalyzeRequest,
     AnalysisResultResponse,
@@ -52,12 +53,16 @@ from api.v1.schemas.system_config import (
     SystemConfigSchemaResponse,
     SystemConfigItem,
     SystemConfigResponse,
+    ExportSystemConfigResponse,
     SystemConfigUpdateItem,
     UpdateSystemConfigRequest,
     UpdateSystemConfigResponse,
     ValidateSystemConfigRequest,
+    ImportSystemConfigRequest,
     ConfigValidationIssue,
     ValidateSystemConfigResponse,
+    LLMCapabilityCheck,
+    LLMCapabilityCheckResult,
     TestLLMChannelRequest,
     TestLLMChannelResponse,
     SystemConfigValidationErrorResponse,
@@ -89,6 +94,18 @@ from api.v1.schemas.portfolio import (
     PortfolioFxRefreshResponse,
     PortfolioRiskResponse,
 )
+from api.v1.schemas.alerts import (
+    AlertDeleteResponse,
+    AlertNotificationItem,
+    AlertNotificationListResponse,
+    AlertRuleCreateRequest,
+    AlertRuleItem,
+    AlertRuleListResponse,
+    AlertRuleTestResponse,
+    AlertRuleUpdateRequest,
+    AlertTriggerItem,
+    AlertTriggerListResponse,
+)
 
 __all__ = [
     # common
@@ -96,6 +113,8 @@ __all__ = [
     "HealthResponse",
     "ErrorResponse",
     "SuccessResponse",
+    # market phase
+    "MarketPhaseSummary",
     # analysis
     "AnalyzeRequest",
     "AnalysisResultResponse",
@@ -130,12 +149,16 @@ __all__ = [
     "SystemConfigSchemaResponse",
     "SystemConfigItem",
     "SystemConfigResponse",
+    "ExportSystemConfigResponse",
     "SystemConfigUpdateItem",
     "UpdateSystemConfigRequest",
     "UpdateSystemConfigResponse",
     "ValidateSystemConfigRequest",
+    "ImportSystemConfigRequest",
     "ConfigValidationIssue",
     "ValidateSystemConfigResponse",
+    "LLMCapabilityCheck",
+    "LLMCapabilityCheckResult",
     "TestLLMChannelRequest",
     "TestLLMChannelResponse",
     "SystemConfigValidationErrorResponse",
@@ -165,4 +188,15 @@ __all__ = [
     "PortfolioImportBrokerListResponse",
     "PortfolioFxRefreshResponse",
     "PortfolioRiskResponse",
+    # alerts
+    "AlertDeleteResponse",
+    "AlertNotificationItem",
+    "AlertNotificationListResponse",
+    "AlertRuleCreateRequest",
+    "AlertRuleItem",
+    "AlertRuleListResponse",
+    "AlertRuleTestResponse",
+    "AlertRuleUpdateRequest",
+    "AlertTriggerItem",
+    "AlertTriggerListResponse",
 ]

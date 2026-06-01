@@ -17,8 +17,10 @@ import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union
 
 import pandas as pd
 from sqlalchemy import (
@@ -39,18 +41,22 @@ from sqlalchemy import (
     or_,
     delete,
     desc,
+    event,
     func,
 )
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
     Session,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
+from src.agent.provider_trace import PROVIDER_TRACE_RETENTION_LIMIT
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -604,6 +610,46 @@ class ConversationMessage(Base):
     created_at = Column(DateTime, default=datetime.now, index=True)
 
 
+class ConversationSummary(Base):
+    """Rolling summary for visible Agent chat history."""
+
+    __tablename__ = 'conversation_summaries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), nullable=False, unique=True, index=True)
+    summary = Column(Text, nullable=False)
+    covered_message_id = Column(Integer, nullable=False, default=0)
+    source_message_count = Column(Integer, nullable=False, default=0)
+    estimated_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+
+class AgentProviderTurn(Base):
+    """Provider protocol trace required for thinking/tool-call roundtrip."""
+
+    __tablename__ = 'agent_provider_turns'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), nullable=False, index=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    provider = Column(String(64), nullable=False, index=True)
+    model = Column(String(160), nullable=False, index=True)
+    anchor_user_message_id = Column(Integer, nullable=False, index=True)
+    anchor_assistant_message_id = Column(Integer, nullable=False, index=True)
+    messages_json = Column(Text, nullable=False)
+    contains_reasoning = Column(Boolean, nullable=False, default=False)
+    contains_tool_calls = Column(Boolean, nullable=False, default=False)
+    contains_thinking_blocks = Column(Boolean, nullable=False, default=False)
+    must_roundtrip = Column(Boolean, nullable=False, default=False, index=True)
+    estimated_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_agent_provider_turn_bucket', 'session_id', 'provider', 'model', 'must_roundtrip'),
+    )
+
+
 class LLMUsage(Base):
     """One row per litellm.completion() call — token-usage audit log."""
 
@@ -620,7 +666,112 @@ class LLMUsage(Base):
     called_at = Column(DateTime, default=datetime.now, index=True)
 
 
-class DatabaseManager:
+class AlertRuleRecord(Base):
+    """Persisted alert rule managed through the Alert API."""
+
+    __tablename__ = 'alert_rules'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(64), nullable=False)
+    target_scope = Column(String(32), nullable=False, default='single_symbol', index=True)
+    target = Column(String(64), nullable=False, index=True)
+    alert_type = Column(String(32), nullable=False, index=True)
+    parameters = Column(Text, nullable=False, default='{}')
+    severity = Column(String(16), nullable=False, default='warning', index=True)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    source = Column(String(16), nullable=False, default='api', index=True)
+    cooldown_policy = Column(Text)
+    notification_policy = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_alert_rule_type_target', 'alert_type', 'target'),
+    )
+
+
+class AlertTriggerRecord(Base):
+    """Alert trigger history row.
+
+    P1 exposes read APIs and table shape; runtime writer integration lands in
+    later phases.
+    """
+
+    __tablename__ = 'alert_triggers'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, index=True)
+    target = Column(String(64), nullable=False, index=True)
+    observed_value = Column(Float)
+    threshold = Column(Float)
+    reason = Column(Text)
+    data_source = Column(String(64))
+    data_timestamp = Column(DateTime, index=True)
+    triggered_at = Column(DateTime, default=datetime.now, index=True)
+    status = Column(String(16), nullable=False, default='triggered', index=True)
+    diagnostics = Column(Text)
+
+    __table_args__ = (
+        Index('ix_alert_trigger_rule_time', 'rule_id', 'triggered_at'),
+    )
+
+
+class AlertNotificationRecord(Base):
+    """Notification attempt row for alert triggers.
+
+    P1 exposes read APIs and table shape; runtime writer integration lands in
+    later phases.
+    """
+
+    __tablename__ = 'alert_notifications'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trigger_id = Column(Integer, index=True)
+    channel = Column(String(32), nullable=False, index=True)
+    attempt = Column(Integer, nullable=False, default=1)
+    success = Column(Boolean, nullable=False, default=False, index=True)
+    error_code = Column(String(64))
+    retryable = Column(Boolean, nullable=False, default=False)
+    latency_ms = Column(Integer)
+    diagnostics = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_alert_notification_trigger_channel', 'trigger_id', 'channel'),
+    )
+
+
+class AlertCooldownRecord(Base):
+    """Persisted alert cooldown state for DB-managed alert rules."""
+
+    __tablename__ = 'alert_cooldowns'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, index=True)
+    # Reserved for future non-DB/expanded-scope rules; P4 queries by rule_id.
+    rule_key = Column(String(255), index=True)
+    target = Column(String(64), nullable=False, index=True)
+    severity = Column(String(16), nullable=False, default='warning', index=True)
+    last_triggered_at = Column(DateTime, index=True)
+    cooldown_until = Column(DateTime, index=True)
+    reason = Column(Text)
+    state = Column(String(16), nullable=False, default='active', index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('rule_id', 'target', 'severity', name='uix_alert_cooldown_rule_target_severity'),
+    )
+
+
+class _DatabaseManagerMeta(type):
+    """Serialize DatabaseManager construction across __new__ and __init__."""
+
+    def __call__(cls, *args, **kwargs):
+        with cls._init_lock:
+            return super().__call__(*args, **kwargs)
+
+
+class DatabaseManager(metaclass=_DatabaseManagerMeta):
     """
     数据库管理器 - 单例模式
     
@@ -631,6 +782,7 @@ class DatabaseManager:
     """
     
     _instance: Optional['DatabaseManager'] = None
+    _init_lock = threading.RLock()
     _initialized: bool = False
     
     def __new__(cls, *args, **kwargs):
@@ -649,49 +801,83 @@ class DatabaseManager:
         """
         if getattr(self, '_initialized', False):
             return
-        
-        if db_url is None:
+
+        created_engine = None
+
+        try:
             config = get_config()
-            db_url = config.get_db_url()
-        
-        # 创建数据库引擎
-        self._engine = create_engine(
-            db_url,
-            echo=False,  # 设为 True 可查看 SQL 语句
-            pool_pre_ping=True,  # 连接健康检查
-        )
-        
-        # 创建 Session 工厂
-        self._SessionLocal = sessionmaker(
-            bind=self._engine,
-            autocommit=False,
-            autoflush=False,
-        )
-        
-        # 创建所有表
-        Base.metadata.create_all(self._engine)
+            if db_url is None:
+                db_url = config.get_db_url()
 
-        self._initialized = True
-        logger.info(f"数据库初始化完成: {db_url}")
+            self._db_url = db_url
+            self._sqlite_wal_enabled = config.sqlite_wal_enabled
+            self._sqlite_busy_timeout_ms = config.sqlite_busy_timeout_ms
+            self._sqlite_write_retry_max = config.sqlite_write_retry_max
+            self._sqlite_write_retry_base_delay = config.sqlite_write_retry_base_delay
 
-        # 注册退出钩子，确保程序退出时关闭数据库连接
-        atexit.register(DatabaseManager._cleanup_engine, self._engine)
-    
+            engine_kwargs = {
+                "echo": False,
+                "pool_pre_ping": True,
+            }
+            if str(db_url).startswith("sqlite:") and self._sqlite_busy_timeout_ms > 0:
+                engine_kwargs["connect_args"] = {
+                    "timeout": self._sqlite_busy_timeout_ms / 1000,
+                }
+
+            # 创建数据库引擎
+            created_engine = create_engine(
+                db_url,
+                **engine_kwargs,
+            )
+            self._engine = created_engine
+            self._is_sqlite_engine = self._engine.url.get_backend_name() == 'sqlite'
+            self._sqlite_file_db = self._is_sqlite_engine and self._is_file_sqlite_database()
+            self._install_sqlite_pragma_handler()
+
+            # 创建 Session 工厂
+            self._SessionLocal = sessionmaker(
+                bind=self._engine,
+                autocommit=False,
+                autoflush=False,
+            )
+
+            # 创建所有表
+            Base.metadata.create_all(self._engine)
+
+            self._initialized = True
+            logger.info(f"数据库初始化完成: {db_url}")
+
+            # 注册退出钩子，确保程序退出时关闭数据库连接
+            atexit.register(DatabaseManager._cleanup_engine, self._engine)
+        except Exception:
+            self._initialized = False
+            try:
+                if created_engine is not None:
+                    created_engine.dispose()
+            except Exception as cleanup_exc:
+                logger.warning("数据库初始化失败后的引擎清理也失败: %s", cleanup_exc)
+            self._engine = None
+            self._SessionLocal = None
+            self.__class__._instance = None
+            raise
+
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
         """获取单例实例"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+        with cls._init_lock:
+            if cls._instance is None:
+                cls()
+            return cls._instance
     
     @classmethod
     def reset_instance(cls) -> None:
         """重置单例（用于测试）"""
-        if cls._instance is not None:
-            if hasattr(cls._instance, '_engine') and cls._instance._engine is not None:
-                cls._instance._engine.dispose()
-            cls._instance._initialized = False
-            cls._instance = None
+        with cls._init_lock:
+            if cls._instance is not None:
+                if hasattr(cls._instance, '_engine') and cls._instance._engine is not None:
+                    cls._instance._engine.dispose()
+                cls._instance._initialized = False
+                cls._instance = None
 
     @classmethod
     def _cleanup_engine(cls, engine) -> None:
@@ -709,6 +895,96 @@ class DatabaseManager:
                 logger.debug("数据库引擎已清理")
         except Exception as e:
             logger.warning(f"清理数据库引擎时出错: {e}")
+
+    def _install_sqlite_pragma_handler(self) -> None:
+        """为 SQLite 连接安装竞争保护参数。"""
+        if not self._is_sqlite_engine:
+            return
+
+        @event.listens_for(self._engine, "connect")
+        def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f"PRAGMA busy_timeout={int(self._sqlite_busy_timeout_ms)}")
+                if self._sqlite_file_db and self._sqlite_wal_enabled:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+            except Exception as exc:
+                logger.warning("初始化 SQLite PRAGMA 失败: %s", exc)
+            finally:
+                cursor.close()
+
+    def _is_file_sqlite_database(self) -> bool:
+        database = (self._engine.url.database or "").strip()
+        return bool(database) and database.lower() != ":memory:"
+
+    def _run_write_transaction(
+        self,
+        operation_name: str,
+        write_operation: Callable[[Session], T],
+    ) -> T:
+        max_retries = self._sqlite_write_retry_max if self._is_sqlite_engine else 0
+
+        for attempt in range(max_retries + 1):
+            session = self.get_session()
+            try:
+                if self._is_sqlite_engine:
+                    # Acquire the SQLite writer lock before any reads inside
+                    # `write_operation()` so pre-write existence checks and the
+                    # later upsert share one consistent write window.
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                result = write_operation(session)
+                session.commit()
+                return result
+            except OperationalError as exc:
+                session.rollback()
+                if (
+                    self._is_sqlite_engine
+                    and self._is_sqlite_locked_error(exc)
+                    and attempt < max_retries
+                ):
+                    delay = self._sqlite_write_retry_base_delay * (2 ** attempt)
+                    logger.warning(
+                        "SQLite 写入锁冲突，准备重试: %s (%s/%s, %.2fs)",
+                        operation_name,
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                raise
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    @staticmethod
+    def _is_sqlite_locked_error(exc: OperationalError) -> bool:
+        err_text = str(getattr(exc, "orig", exc)).lower()
+        return any(
+            token in err_text
+            for token in (
+                "database is locked",
+                "database schema is locked",
+                "database table is locked",
+            )
+        )
+
+    @staticmethod
+    def _normalize_daily_date(value: Any) -> Any:
+        if isinstance(value, str):
+            return datetime.strptime(value, '%Y-%m-%d').date()
+        if isinstance(value, pd.Timestamp):
+            return value.date()
+        if isinstance(value, datetime):
+            return value.date()
+        return value
+
+    @staticmethod
+    def _normalize_sql_value(value: Any) -> Any:
+        return None if pd.isna(value) else value
     
     def get_session(self) -> Session:
         """
@@ -828,103 +1104,106 @@ class DatabaseManager:
         query_ctx = query_context or {}
         current_query_id = (query_ctx.get("query_id") or "").strip()
 
-        with self.get_session() as session:
-            try:
-                for item in response.results:
-                    title = (item.title or '').strip()
-                    url = (item.url or '').strip()
-                    source = (item.source or '').strip()
-                    snippet = (item.snippet or '').strip()
-                    published_date = self._parse_published_date(item.published_date)
+        def _write(session: Session) -> int:
+            local_saved_count = 0
 
-                    if not title and not url:
-                        continue
+            for item in response.results:
+                title = (item.title or '').strip()
+                url = (item.url or '').strip()
+                source = (item.source or '').strip()
+                snippet = (item.snippet or '').strip()
+                published_date = self._parse_published_date(item.published_date)
 
-                    url_key = url or self._build_fallback_url_key(
-                        code=code,
-                        title=title,
-                        source=source,
-                        published_date=published_date
-                    )
+                if not title and not url:
+                    continue
 
-                    # 优先按 URL 或兜底键去重
-                    existing = session.execute(
-                        select(NewsIntel).where(NewsIntel.url == url_key)
-                    ).scalar_one_or_none()
+                url_key = url or self._build_fallback_url_key(
+                    code=code,
+                    title=title,
+                    source=source,
+                    published_date=published_date
+                )
 
-                    if existing:
-                        existing.name = name or existing.name
-                        existing.dimension = dimension or existing.dimension
-                        existing.query = query or existing.query
-                        existing.provider = response.provider or existing.provider
-                        existing.snippet = snippet or existing.snippet
-                        existing.source = source or existing.source
-                        existing.published_date = published_date or existing.published_date
-                        existing.fetched_at = datetime.now()
+                existing = session.execute(
+                    select(NewsIntel).where(NewsIntel.url == url_key)
+                ).scalar_one_or_none()
 
-                        if query_context:
-                            # Keep the first query_id to avoid overwriting historical links.
-                            if not existing.query_id and current_query_id:
-                                existing.query_id = current_query_id
-                            existing.query_source = (
-                                query_context.get("query_source") or existing.query_source
-                            )
-                            existing.requester_platform = (
-                                query_context.get("requester_platform") or existing.requester_platform
-                            )
-                            existing.requester_user_id = (
-                                query_context.get("requester_user_id") or existing.requester_user_id
-                            )
-                            existing.requester_user_name = (
-                                query_context.get("requester_user_name") or existing.requester_user_name
-                            )
-                            existing.requester_chat_id = (
-                                query_context.get("requester_chat_id") or existing.requester_chat_id
-                            )
-                            existing.requester_message_id = (
-                                query_context.get("requester_message_id") or existing.requester_message_id
-                            )
-                            existing.requester_query = (
-                                query_context.get("requester_query") or existing.requester_query
-                            )
-                    else:
-                        try:
-                            with session.begin_nested():
-                                record = NewsIntel(
-                                    code=code,
-                                    name=name,
-                                    dimension=dimension,
-                                    query=query,
-                                    provider=response.provider,
-                                    title=title,
-                                    snippet=snippet,
-                                    url=url_key,
-                                    source=source,
-                                    published_date=published_date,
-                                    fetched_at=datetime.now(),
-                                    query_id=current_query_id or None,
-                                    query_source=query_ctx.get("query_source"),
-                                    requester_platform=query_ctx.get("requester_platform"),
-                                    requester_user_id=query_ctx.get("requester_user_id"),
-                                    requester_user_name=query_ctx.get("requester_user_name"),
-                                    requester_chat_id=query_ctx.get("requester_chat_id"),
-                                    requester_message_id=query_ctx.get("requester_message_id"),
-                                    requester_query=query_ctx.get("requester_query"),
-                                )
-                                session.add(record)
-                                session.flush()
-                            saved_count += 1
-                        except IntegrityError:
-                            # 单条 URL 唯一约束冲突（如并发插入），仅跳过本条，保留本批其余成功项
-                            logger.debug("新闻情报重复（已跳过）: %s %s", code, url_key)
+                if existing:
+                    existing.name = name or existing.name
+                    existing.dimension = dimension or existing.dimension
+                    existing.query = query or existing.query
+                    existing.provider = response.provider or existing.provider
+                    existing.snippet = snippet or existing.snippet
+                    existing.source = source or existing.source
+                    existing.published_date = published_date or existing.published_date
+                    existing.fetched_at = datetime.now()
 
-                session.commit()
-                logger.info(f"保存新闻情报成功: {code}, 新增 {saved_count} 条")
+                    if query_context:
+                        if not existing.query_id and current_query_id:
+                            existing.query_id = current_query_id
+                        existing.query_source = (
+                            query_context.get("query_source") or existing.query_source
+                        )
+                        existing.requester_platform = (
+                            query_context.get("requester_platform") or existing.requester_platform
+                        )
+                        existing.requester_user_id = (
+                            query_context.get("requester_user_id") or existing.requester_user_id
+                        )
+                        existing.requester_user_name = (
+                            query_context.get("requester_user_name") or existing.requester_user_name
+                        )
+                        existing.requester_chat_id = (
+                            query_context.get("requester_chat_id") or existing.requester_chat_id
+                        )
+                        existing.requester_message_id = (
+                            query_context.get("requester_message_id") or existing.requester_message_id
+                        )
+                        existing.requester_query = (
+                            query_context.get("requester_query") or existing.requester_query
+                        )
+                    continue
 
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存新闻情报失败: {e}")
-                raise
+                try:
+                    with session.begin_nested():
+                        record = NewsIntel(
+                            code=code,
+                            name=name,
+                            dimension=dimension,
+                            query=query,
+                            provider=response.provider,
+                            title=title,
+                            snippet=snippet,
+                            url=url_key,
+                            source=source,
+                            published_date=published_date,
+                            fetched_at=datetime.now(),
+                            query_id=current_query_id or None,
+                            query_source=query_ctx.get("query_source"),
+                            requester_platform=query_ctx.get("requester_platform"),
+                            requester_user_id=query_ctx.get("requester_user_id"),
+                            requester_user_name=query_ctx.get("requester_user_name"),
+                            requester_chat_id=query_ctx.get("requester_chat_id"),
+                            requester_message_id=query_ctx.get("requester_message_id"),
+                            requester_query=query_ctx.get("requester_query"),
+                        )
+                        session.add(record)
+                        session.flush()
+                    local_saved_count += 1
+                except IntegrityError:
+                    logger.debug("新闻情报重复（已跳过）: %s %s", code, url_key)
+
+            return local_saved_count
+
+        try:
+            saved_count = self._run_write_transaction(
+                f"save_news_intel[{code}]",
+                _write,
+            )
+            logger.info(f"保存新闻情报成功: {code}, 新增 {saved_count} 条")
+        except Exception as e:
+            logger.error(f"保存新闻情报失败: {e}")
+            raise
 
         return saved_count
 
@@ -942,8 +1221,8 @@ class DatabaseManager:
         if not query_id or not code or payload is None:
             return 0
 
-        with self.get_session() as session:
-            try:
+        try:
+            def _write(session: Session) -> int:
                 session.add(
                     FundamentalSnapshot(
                         query_id=query_id,
@@ -953,17 +1232,62 @@ class DatabaseManager:
                         coverage=self._safe_json_dumps(coverage or {}),
                     )
                 )
-                session.commit()
                 return 1
+            return self._run_write_transaction(
+                f"save_fundamental_snapshot[{query_id}:{code}]",
+                _write,
+            )
+        except Exception as e:
+            logger.debug(
+                "基本面快照写入失败（fail-open）: query_id=%s code=%s err=%s",
+                query_id,
+                code,
+                e,
+            )
+            return 0
+
+    def get_latest_fundamental_snapshot(
+        self,
+        query_id: str,
+        code: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        获取指定 query_id + code 的最新基本面快照 payload。
+
+        读取失败或不存在时返回 None（fail-open）。
+        """
+        if not query_id or not code:
+            return None
+
+        with self.get_session() as session:
+            try:
+                row = session.execute(
+                    select(FundamentalSnapshot)
+                    .where(
+                        and_(
+                            FundamentalSnapshot.query_id == query_id,
+                            FundamentalSnapshot.code == code,
+                        )
+                    )
+                    .order_by(desc(FundamentalSnapshot.created_at))
+                    .limit(1)
+                ).scalar_one_or_none()
             except Exception as e:
-                session.rollback()
                 logger.debug(
-                    "基本面快照写入失败（fail-open）: query_id=%s code=%s err=%s",
+                    "基本面快照读取失败（fail-open）: query_id=%s code=%s err=%s",
                     query_id,
                     code,
                     e,
                 )
-                return 0
+                return None
+
+            if row is None:
+                return None
+            try:
+                payload = json.loads(row.payload or "{}")
+                return payload if isinstance(payload, dict) else None
+            except Exception:
+                return None
 
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
@@ -1033,34 +1357,115 @@ class DatabaseManager:
         if save_snapshot and context_snapshot is not None:
             context_text = self._safe_json_dumps(context_snapshot)
 
-        record = AnalysisHistory(
-            query_id=query_id,
-            code=result.code,
-            name=result.name,
-            report_type=report_type,
-            sentiment_score=result.sentiment_score,
-            operation_advice=result.operation_advice,
-            trend_prediction=result.trend_prediction,
-            analysis_summary=result.analysis_summary,
-            raw_result=self._safe_json_dumps(raw_result),
-            news_content=news_content,
-            context_snapshot=context_text,
-            ideal_buy=sniper_points.get("ideal_buy"),
-            secondary_buy=sniper_points.get("secondary_buy"),
-            stop_loss=sniper_points.get("stop_loss"),
-            take_profit=sniper_points.get("take_profit"),
-            created_at=datetime.now(),
-        )
-
-        with self.get_session() as session:
-            try:
-                session.add(record)
-                session.commit()
+        try:
+            def _write(session: Session) -> int:
+                session.add(
+                    AnalysisHistory(
+                        query_id=query_id,
+                        code=result.code,
+                        name=result.name,
+                        report_type=report_type,
+                        sentiment_score=result.sentiment_score,
+                        operation_advice=result.operation_advice,
+                        trend_prediction=result.trend_prediction,
+                        analysis_summary=result.analysis_summary,
+                        raw_result=self._safe_json_dumps(raw_result),
+                        news_content=news_content,
+                        context_snapshot=context_text,
+                        ideal_buy=sniper_points.get("ideal_buy"),
+                        secondary_buy=sniper_points.get("secondary_buy"),
+                        stop_loss=sniper_points.get("stop_loss"),
+                        take_profit=sniper_points.get("take_profit"),
+                        created_at=datetime.now(),
+                    )
+                )
                 return 1
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存分析历史失败: {e}")
-                return 0
+            return self._run_write_transaction(
+                f"save_analysis_history[{result.code}]",
+                _write,
+            )
+        except Exception as e:
+            logger.error(f"保存分析历史失败: {e}")
+            return 0
+
+    def update_analysis_history_diagnostics(
+        self,
+        *,
+        query_id: str,
+        code: Optional[str] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+        notification_runs: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        """
+        更新已保存分析历史的运行诊断快照。
+
+        通知结果通常在分析历史落库后才产生，因此这里仅补写
+        context_snapshot.diagnostics，不改变报告正文或其它历史字段。
+        """
+        if not query_id or (diagnostics is None and not notification_runs):
+            return 0
+
+        try:
+            def _write(session: Session) -> int:
+                conditions = [AnalysisHistory.query_id == query_id]
+                if code:
+                    conditions.append(AnalysisHistory.code == code)
+
+                row = session.execute(
+                    select(AnalysisHistory)
+                    .where(and_(*conditions))
+                    .order_by(desc(AnalysisHistory.created_at))
+                    .limit(1)
+                ).scalars().first()
+                if row is None:
+                    return 0
+
+                context_snapshot: Dict[str, Any] = {}
+                if row.context_snapshot:
+                    try:
+                        parsed = json.loads(row.context_snapshot)
+                        if isinstance(parsed, dict):
+                            context_snapshot = parsed
+                    except Exception:
+                        context_snapshot = {}
+
+                if diagnostics is not None:
+                    context_snapshot["diagnostics"] = diagnostics
+                else:
+                    existing_diagnostics = context_snapshot.get("diagnostics")
+                    if not isinstance(existing_diagnostics, dict):
+                        existing_diagnostics = {
+                            "query_id": query_id,
+                            "stock_code": code,
+                            "notification_runs": [],
+                        }
+                    runs = existing_diagnostics.get("notification_runs")
+                    if not isinstance(runs, list):
+                        runs = []
+                    trace_id = existing_diagnostics.get("trace_id")
+                    for run in notification_runs or []:
+                        if isinstance(run, dict):
+                            run_payload = dict(run)
+                            if trace_id and not run_payload.get("trace_id"):
+                                run_payload["trace_id"] = trace_id
+                            runs.append(run_payload)
+                    existing_diagnostics["notification_runs"] = runs
+                    context_snapshot["diagnostics"] = existing_diagnostics
+                row.context_snapshot = self._safe_json_dumps(context_snapshot)
+                return 1
+
+            return self._run_write_transaction(
+                f"update_analysis_history_diagnostics[{query_id}:{code or '*'}]",
+                _write,
+            )
+        except Exception as e:
+            logger.warning(
+                "更新分析历史诊断快照失败（fail-open）: query_id=%s code=%s err=%s",
+                query_id,
+                code,
+                e,
+            )
+            return 0
 
     def get_analysis_history(
         self,
@@ -1106,7 +1511,7 @@ class DatabaseManager:
     
     def get_analysis_history_paginated(
         self,
-        code: Optional[str] = None,
+        code: Optional[Union[str, List[str]]] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         offset: int = 0,
@@ -1131,7 +1536,12 @@ class DatabaseManager:
             conditions = []
             
             if code:
-                conditions.append(AnalysisHistory.code == code)
+                if isinstance(code, list):
+                    codes = [c for c in code if c]
+                    if codes:
+                        conditions.append(AnalysisHistory.code.in_(codes))
+                else:
+                    conditions.append(AnalysisHistory.code == code)
             if start_date:
                 # created_at >= start_date 00:00:00
                 conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
@@ -1265,8 +1675,9 @@ class DatabaseManager:
         保存日线数据到数据库
         
         策略：
-        - 使用 UPSERT 逻辑（存在则更新，不存在则插入）
-        - 跳过已存在的数据，避免重复
+        - 按 `(code, date)` 做批量 UPSERT，已存在记录会覆盖更新
+        - 同一批次内若存在重复日期，以最后一条记录为准
+        - SQLite 分支按 chunk 写入以避免绑定参数上限
         
         Args:
             df: 包含日线数据的 DataFrame
@@ -1274,81 +1685,137 @@ class DatabaseManager:
             data_source: 数据来源名称
             
         Returns:
-            新增/更新的记录数
+            本次实际新增的记录数（不含更新）
         """
         if df is None or df.empty:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0
-        
-        saved_count = 0
-        
-        with self.get_session() as session:
-            try:
-                for _, row in df.iterrows():
-                    # 解析日期
-                    row_date = row.get('date')
-                    if isinstance(row_date, str):
-                        row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
-                    elif isinstance(row_date, datetime):
-                        row_date = row_date.date()
-                    elif isinstance(row_date, pd.Timestamp):
-                        row_date = row_date.date()
-                    
-                    # 检查是否已存在
-                    existing = session.execute(
+
+        now = datetime.now()
+        records_by_date: Dict[date, Dict[str, Any]] = {}
+        for row in df.to_dict(orient='records'):
+            row_date = self._normalize_daily_date(row.get('date'))
+            records_by_date[row_date] = {
+                'code': code,
+                'date': row_date,
+                'open': self._normalize_sql_value(row.get('open')),
+                'high': self._normalize_sql_value(row.get('high')),
+                'low': self._normalize_sql_value(row.get('low')),
+                'close': self._normalize_sql_value(row.get('close')),
+                'volume': self._normalize_sql_value(row.get('volume')),
+                'amount': self._normalize_sql_value(row.get('amount')),
+                'pct_chg': self._normalize_sql_value(row.get('pct_chg')),
+                'ma5': self._normalize_sql_value(row.get('ma5')),
+                'ma10': self._normalize_sql_value(row.get('ma10')),
+                'ma20': self._normalize_sql_value(row.get('ma20')),
+                'volume_ratio': self._normalize_sql_value(row.get('volume_ratio')),
+                'data_source': data_source,
+                'created_at': now,
+                'updated_at': now,
+            }
+
+        if not records_by_date:
+            return 0
+
+        records = list(records_by_date.values())
+        batch_dates = list(records_by_date.keys())
+
+        def _write(session: Session) -> int:
+            if self._is_sqlite_engine:
+                # SQLite has a per-statement bind-parameter limit (commonly 999).
+                # Each record has ~15 columns, so chunk upserts to stay within bounds.
+                _SQLITE_CHUNK = 50
+                # `_run_write_transaction()` opens SQLite writes with
+                # `BEGIN IMMEDIATE`, so existence checks and upsert execute
+                # within one stable write window.
+                existing_dates = set()
+                _COUNT_CHUNK = 500
+                for j in range(0, len(batch_dates), _COUNT_CHUNK):
+                    chunk_dates = batch_dates[j : j + _COUNT_CHUNK]
+                    if not chunk_dates:
+                        continue
+                    existing_dates.update(
+                        session.execute(
+                            select(StockDaily.date).where(
+                                and_(
+                                    StockDaily.code == code,
+                                    StockDaily.date.in_(chunk_dates),
+                                )
+                            )
+                        ).scalars().all()
+                    )
+                new_records = [
+                    record for record in records if record['date'] not in existing_dates
+                ]
+                for i in range(0, len(records), _SQLITE_CHUNK):
+                    chunk = records[i : i + _SQLITE_CHUNK]
+                    stmt = sqlite_insert(StockDaily).values(chunk)
+                    excluded = stmt.excluded
+                    session.execute(
+                        stmt.on_conflict_do_update(
+                            index_elements=['code', 'date'],
+                            set_={
+                                'open': excluded.open,
+                                'high': excluded.high,
+                                'low': excluded.low,
+                                'close': excluded.close,
+                                'volume': excluded.volume,
+                                'amount': excluded.amount,
+                                'pct_chg': excluded.pct_chg,
+                                'ma5': excluded.ma5,
+                                'ma10': excluded.ma10,
+                                'ma20': excluded.ma20,
+                                'volume_ratio': excluded.volume_ratio,
+                                'data_source': excluded.data_source,
+                                'updated_at': excluded.updated_at,
+                            },
+                        )
+                    )
+                return len(new_records)
+            else:
+                existing_rows = {
+                    row.date: row
+                    for row in session.execute(
                         select(StockDaily).where(
                             and_(
                                 StockDaily.code == code,
-                                StockDaily.date == row_date
+                                StockDaily.date.in_(batch_dates),
                             )
                         )
-                    ).scalar_one_or_none()
-                    
-                    if existing:
-                        # 更新现有记录
-                        existing.open = row.get('open')
-                        existing.high = row.get('high')
-                        existing.low = row.get('low')
-                        existing.close = row.get('close')
-                        existing.volume = row.get('volume')
-                        existing.amount = row.get('amount')
-                        existing.pct_chg = row.get('pct_chg')
-                        existing.ma5 = row.get('ma5')
-                        existing.ma10 = row.get('ma10')
-                        existing.ma20 = row.get('ma20')
-                        existing.volume_ratio = row.get('volume_ratio')
-                        existing.data_source = data_source
-                        existing.updated_at = datetime.now()
-                    else:
-                        # 创建新记录
-                        record = StockDaily(
-                            code=code,
-                            date=row_date,
-                            open=row.get('open'),
-                            high=row.get('high'),
-                            low=row.get('low'),
-                            close=row.get('close'),
-                            volume=row.get('volume'),
-                            amount=row.get('amount'),
-                            pct_chg=row.get('pct_chg'),
-                            ma5=row.get('ma5'),
-                            ma10=row.get('ma10'),
-                            ma20=row.get('ma20'),
-                            volume_ratio=row.get('volume_ratio'),
-                            data_source=data_source,
-                        )
-                        session.add(record)
-                        saved_count += 1
-                
-                session.commit()
-                logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
-                
-            except Exception as e:
-                session.rollback()
-                logger.error(f"保存 {code} 数据失败: {e}")
-                raise
-        
-        return saved_count
+                    ).scalars().all()
+                }
+                new_count = 0
+                for record in records:
+                    existing = existing_rows.get(record['date'])
+                    if existing is None:
+                        session.add(StockDaily(**record))
+                        new_count += 1
+                        continue
+                    existing.open = record['open']
+                    existing.high = record['high']
+                    existing.low = record['low']
+                    existing.close = record['close']
+                    existing.volume = record['volume']
+                    existing.amount = record['amount']
+                    existing.pct_chg = record['pct_chg']
+                    existing.ma5 = record['ma5']
+                    existing.ma10 = record['ma10']
+                    existing.ma20 = record['ma20']
+                    existing.volume_ratio = record['volume_ratio']
+                    existing.data_source = record['data_source']
+                    existing.updated_at = record['updated_at']
+                return new_count
+
+        try:
+            saved_count = self._run_write_transaction(
+                f"save_daily_data[{code}]",
+                _write,
+            )
+            logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
+            return saved_count
+        except Exception as e:
+            logger.error(f"保存 {code} 数据失败: {e}")
+            raise
     
     def get_analysis_context(
         self, 
@@ -1653,7 +2120,7 @@ class DatabaseManager:
         digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
         return f"no-url:{code}:{digest}"
 
-    def save_conversation_message(self, session_id: str, role: str, content: str) -> None:
+    def save_conversation_message(self, session_id: str, role: str, content: str) -> int:
         """
         保存 Agent 对话消息
         """
@@ -1664,6 +2131,8 @@ class DatabaseManager:
                 content=content
             )
             session.add(msg)
+            session.flush()
+            return int(msg.id)
 
     def get_conversation_history(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -1677,6 +2146,215 @@ class DatabaseManager:
 
             # 倒序返回，保证时间顺序
             return [{"role": msg.role, "content": msg.content} for msg in reversed(messages)]
+
+    def get_visible_conversation_messages(self, session_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return visible user/assistant conversation messages in chronological order."""
+        with self.session_scope() as session:
+            stmt = (
+                select(ConversationMessage)
+                .where(
+                    and_(
+                        ConversationMessage.session_id == session_id,
+                        ConversationMessage.role.in_(["user", "assistant"]),
+                    )
+                )
+                .order_by(ConversationMessage.created_at, ConversationMessage.id)
+            )
+            if limit is not None:
+                stmt = (
+                    stmt.order_by(None)
+                    .order_by(ConversationMessage.created_at.desc(), ConversationMessage.id.desc())
+                    .limit(limit)
+                )
+            messages = session.execute(stmt).scalars().all()
+            if limit is not None:
+                messages = list(reversed(messages))
+            return [
+                {
+                    "id": msg.id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "created_at": msg.created_at,
+                }
+                for msg in messages
+                if msg.content
+            ]
+
+    def get_conversation_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the rolling summary for a conversation session, if present."""
+        with self.session_scope() as session:
+            stmt = select(ConversationSummary).where(
+                ConversationSummary.session_id == session_id
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                "id": row.id,
+                "session_id": row.session_id,
+                "summary": row.summary,
+                "covered_message_id": row.covered_message_id,
+                "source_message_count": row.source_message_count,
+                "estimated_tokens": row.estimated_tokens,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+
+    def save_agent_provider_turn(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        provider: str,
+        model: str,
+        anchor_user_message_id: int,
+        anchor_assistant_message_id: int,
+        messages: List[Dict[str, Any]],
+        contains_reasoning: bool,
+        contains_tool_calls: bool,
+        contains_thinking_blocks: bool,
+        must_roundtrip: bool,
+        estimated_tokens: int,
+    ) -> int:
+        """Persist one provider protocol trace and enforce per-model retention."""
+        with self.session_scope() as session:
+            row = AgentProviderTurn(
+                session_id=session_id,
+                run_id=run_id,
+                provider=provider,
+                model=model,
+                anchor_user_message_id=int(anchor_user_message_id or 0),
+                anchor_assistant_message_id=int(anchor_assistant_message_id or 0),
+                messages_json=json.dumps(messages or [], ensure_ascii=False, default=str),
+                contains_reasoning=bool(contains_reasoning),
+                contains_tool_calls=bool(contains_tool_calls),
+                contains_thinking_blocks=bool(contains_thinking_blocks),
+                must_roundtrip=bool(must_roundtrip),
+                estimated_tokens=int(estimated_tokens or 0),
+            )
+            session.add(row)
+            session.flush()
+            row_id = int(row.id)
+            if row.must_roundtrip:
+                self._trim_agent_provider_turns(
+                    session=session,
+                    session_id=session_id,
+                    provider=provider,
+                    model=model,
+                    keep=PROVIDER_TRACE_RETENTION_LIMIT,
+                )
+            return row_id
+
+    def get_agent_provider_turns(
+        self,
+        session_id: str,
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        must_roundtrip_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return provider trace turns in chronological order."""
+        with self.session_scope() as session:
+            conditions = [AgentProviderTurn.session_id == session_id]
+            if provider:
+                conditions.append(AgentProviderTurn.provider == provider)
+            if model:
+                conditions.append(AgentProviderTurn.model == model)
+            if must_roundtrip_only:
+                conditions.append(AgentProviderTurn.must_roundtrip.is_(True))
+            stmt = (
+                select(AgentProviderTurn)
+                .where(and_(*conditions))
+                .order_by(AgentProviderTurn.created_at, AgentProviderTurn.id)
+            )
+            rows = session.execute(stmt).scalars().all()
+            result = []
+            for row in rows:
+                try:
+                    messages = json.loads(row.messages_json or "[]")
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "Invalid provider trace messages_json skipped for session %s turn %s: %s",
+                        row.session_id,
+                        row.id,
+                        exc,
+                    )
+                    messages = []
+                result.append({
+                    "id": row.id,
+                    "session_id": row.session_id,
+                    "run_id": row.run_id,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "anchor_user_message_id": row.anchor_user_message_id,
+                    "anchor_assistant_message_id": row.anchor_assistant_message_id,
+                    "messages": messages if isinstance(messages, list) else [],
+                    "messages_json": row.messages_json,
+                    "contains_reasoning": row.contains_reasoning,
+                    "contains_tool_calls": row.contains_tool_calls,
+                    "contains_thinking_blocks": row.contains_thinking_blocks,
+                    "must_roundtrip": row.must_roundtrip,
+                    "estimated_tokens": row.estimated_tokens,
+                    "created_at": row.created_at,
+                })
+            return result
+
+    def _trim_agent_provider_turns(
+        self,
+        *,
+        session: Session,
+        session_id: str,
+        provider: str,
+        model: str,
+        keep: int,
+    ) -> int:
+        old_ids_stmt = (
+            select(AgentProviderTurn.id)
+            .where(
+                and_(
+                    AgentProviderTurn.session_id == session_id,
+                    AgentProviderTurn.provider == provider,
+                    AgentProviderTurn.model == model,
+                    AgentProviderTurn.must_roundtrip.is_(True),
+                )
+            )
+            .order_by(AgentProviderTurn.created_at.desc(), AgentProviderTurn.id.desc())
+            .offset(max(0, int(keep)))
+        )
+        old_ids = list(session.execute(old_ids_stmt).scalars().all())
+        if not old_ids:
+            return 0
+        result = session.execute(
+            delete(AgentProviderTurn).where(AgentProviderTurn.id.in_(old_ids))
+        )
+        return int(result.rowcount or 0)
+
+    def upsert_conversation_summary(
+        self,
+        session_id: str,
+        summary: str,
+        covered_message_id: int,
+        source_message_count: int,
+        estimated_tokens: int,
+    ) -> None:
+        """Create or update the rolling summary for a conversation session."""
+        with self.session_scope() as session:
+            now = datetime.now()
+            values = {
+                "session_id": session_id,
+                "summary": summary,
+                "covered_message_id": int(covered_message_id or 0),
+                "source_message_count": int(source_message_count or 0),
+                "estimated_tokens": int(estimated_tokens or 0),
+                "updated_at": now,
+            }
+            stmt = sqlite_insert(ConversationSummary).values(**values)
+            session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["session_id"],
+                    set_=values,
+                )
+            )
 
     def conversation_session_exists(self, session_id: str) -> bool:
         """Return True when at least one message exists for the given session."""
@@ -1796,6 +2474,16 @@ class DatabaseManager:
             删除的消息数
         """
         with self.session_scope() as session:
+            session.execute(
+                delete(AgentProviderTurn).where(
+                    AgentProviderTurn.session_id == session_id
+                )
+            )
+            session.execute(
+                delete(ConversationSummary).where(
+                    ConversationSummary.session_id == session_id
+                )
+            )
             result = session.execute(
                 delete(ConversationMessage).where(
                     ConversationMessage.session_id == session_id
