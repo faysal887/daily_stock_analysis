@@ -404,6 +404,10 @@ class Config:
     # 仅分析结果摘要：true 时只推送汇总，不含个股详情（Issue #262）
     report_summary_only: bool = False
 
+    # Output language/currency
+    output_language: str = "zh"
+    output_currency: str = "CNY"
+
     # Report Engine P0: Jinja2 renderer and integrity checks
     report_templates_dir: str = "templates"  # Template directory (relative to project root)
     report_renderer_enabled: bool = False  # Enable Jinja2 rendering (default off for zero regression)
@@ -938,6 +942,8 @@ class Config:
             single_stock_notify=os.getenv('SINGLE_STOCK_NOTIFY', 'false').lower() == 'true',
             report_type=cls._parse_report_type(os.getenv('REPORT_TYPE', 'simple')),
             report_summary_only=os.getenv('REPORT_SUMMARY_ONLY', 'false').lower() == 'true',
+            output_language=os.getenv('OUTPUT_LANGUAGE', 'zh').lower(),
+            output_currency=os.getenv('OUTPUT_CURRENCY', 'CNY').upper(),
             report_templates_dir=os.getenv('REPORT_TEMPLATES_DIR', 'templates'),
             report_renderer_enabled=os.getenv('REPORT_RENDERER_ENABLED', 'false').lower() == 'true',
             report_integrity_enabled=os.getenv('REPORT_INTEGRITY_ENABLED', 'true').lower() == 'true',

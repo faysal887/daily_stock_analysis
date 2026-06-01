@@ -24,17 +24,43 @@ def _get_signal_level(result: AnalysisResult) -> tuple:
     advice = result.operation_advice
     score = result.sentiment_score
     advice_map = {
-        "强烈买入": ("强烈买入", "💚", "强买"),
-        "买入": ("买入", "🟢", "买入"),
-        "加仓": ("买入", "🟢", "买入"),
-        "持有": ("持有", "🟡", "持有"),
-        "观望": ("观望", "⚪", "观望"),
-        "减仓": ("减仓", "🟠", "减仓"),
-        "卖出": ("卖出", "🔴", "卖出"),
-        "强烈卖出": ("卖出", "🔴", "卖出"),
+        # English
+        "Strong Buy": ("Strong Buy", "💚", "Strong Buy"),
+        "Buy": ("Buy", "🟢", "Buy"),
+        "Add": ("Buy", "🟢", "Buy"),
+        "Hold": ("Hold", "🟡", "Hold"),
+        "Watch": ("Watch", "⚪", "Watch"),
+        "Reduce": ("Reduce", "🟠", "Reduce"),
+        "Sell": ("Sell", "🔴", "Sell"),
+        "Strong Sell": ("Sell", "🔴", "Sell"),
+        # Chinese
+        "强烈买入": ("Strong Buy", "💚", "Strong Buy"),
+        "买入": ("Buy", "🟢", "Buy"),
+        "加仓": ("Buy", "🟢", "Buy"),
+        "持有": ("Hold", "🟡", "Hold"),
+        "观望": ("Watch", "⚪", "Watch"),
+        "减仓": ("Reduce", "🟠", "Reduce"),
+        "卖出": ("Sell", "🔴", "Sell"),
+        "强烈卖出": ("Sell", "🔴", "Sell"),
     }
     if advice in advice_map:
         return advice_map[advice]
+
+    config = get_config()
+    is_en = str(getattr(config, "output_language", "zh")).lower().startswith("en")
+    if is_en:
+        if score >= 80:
+            return ("Strong Buy", "💚", "Strong Buy")
+        if score >= 65:
+            return ("Buy", "🟢", "Buy")
+        if score >= 55:
+            return ("Hold", "🟡", "Hold")
+        if score >= 45:
+            return ("Watch", "⚪", "Watch")
+        if score >= 35:
+            return ("Reduce", "🟠", "Reduce")
+        return ("Sell", "🔴", "Sell")
+
     if score >= 80:
         return ("强烈买入", "💚", "强买")
     elif score >= 65:
@@ -48,6 +74,7 @@ def _get_signal_level(result: AnalysisResult) -> tuple:
     elif score < 35:
         return ("卖出", "🔴", "卖出")
     return ("观望", "⚪", "观望")
+
 
 
 def _escape_md(text: str) -> str:
@@ -69,6 +96,8 @@ def _clean_sniper_value(val: Any) -> str:
     prefixes = [
         "理想买入点：", "次优买入点：", "止损位：", "目标位：",
         "理想买入点:", "次优买入点:", "止损位:", "目标位:",
+        "Ideal buy:", "Secondary buy:", "Stop loss:", "Take profit:",
+        "Ideal buy", "Secondary buy", "Stop loss", "Take profit",
     ]
     for prefix in prefixes:
         if s.startswith(prefix):
@@ -127,9 +156,14 @@ def render(
     # Build template context with pre-computed signal levels (sorted by score)
     sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
     sorted_enriched = []
+    config = get_config()
+    is_en = str(getattr(config, "output_language", "zh")).lower().startswith("en")
     for r in sorted_results:
         st, se, _ = _get_signal_level(r)
-        rn = r.name if r.name and not r.name.startswith("股票") else f"股票{r.code}"
+        if is_en:
+            rn = r.name if r.name and not str(r.name).startswith("Stock") else f"Stock {r.code}"
+        else:
+            rn = r.name if r.name and not r.name.startswith("股票") else f"股票{r.code}"
         sorted_enriched.append({
             "result": r,
             "signal_text": st,
@@ -146,7 +180,9 @@ def render(
     def failed_checks(checklist: List[str]) -> List[str]:
         return [c for c in (checklist or []) if c.startswith("❌") or c.startswith("⚠️")]
 
+    currency = getattr(get_config(), 'output_currency', 'USD')
     context: Dict[str, Any] = {
+        "currency": currency,
         "report_date": report_date,
         "report_timestamp": report_timestamp,
         "results": sorted_results,

@@ -682,6 +682,193 @@ class GeminiAnalyzer:
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出"""
 
+    SYSTEM_PROMPT_EN = """You are a trend-following US equity analyst tasked with producing a professional **Decision Dashboard** report.
+
+## Core Trading Principles (must follow)
+
+### 1. Strict Entry Discipline (Do not chase)
+- **Never chase price**: if price deviates from MA5 by more than 5%, do not buy
+- **Bias formula**: (Price - MA5) / MA5 × 100%
+- Bias < 2%: ideal buy zone
+- Bias 2-5%: small starter position only
+- Bias > 5%: **no chase** → mark as "Watch"
+
+### 2. Trend Following (trade with the trend)
+- **Bullish alignment is required**: MA5 > MA10 > MA20
+- Do not trade bearish alignment
+- Wider MA spread is stronger trend
+
+### 3. Efficiency (chip/positioning)
+- Focus on concentration: 90% concentration < 15% indicates tight positioning
+- Profit ratio 70-90% implies potential profit taking risk
+- Average cost vs price: price 5-15% above avg cost is healthy
+
+### 4. Preferred Entry (pullback to support)
+- **Best entry**: low-volume pullback holding MA5
+- **Secondary**: pullback holding MA10
+- **Avoid**: break below MA20
+
+### 5. Risk Checklist
+- Insider/shareholder sell-downs
+- Earnings warnings / sharp deterioration
+- Regulatory penalties / investigations
+- Industry policy headwinds
+- Large lockup expirations
+
+### 6. Valuation Awareness (PE/PB)
+- Comment on whether PE is reasonable
+- If PE is clearly elevated vs sector/history, flag as risk
+- High-growth names may tolerate higher PE if supported by earnings
+
+### 7. Exception for Strong Trend Leaders
+- For strong trend leaders with solid volume confirmation, bias limits can be relaxed
+- Still require stop-loss discipline; do not blindly chase
+
+## Output Format: Decision Dashboard JSON
+
+Return **only** valid JSON in the following schema:
+
+```json
+{
+    "stock_name": "English company name",
+    "sentiment_score": 0-100,
+    "trend_prediction": "Strong Bullish/Bullish/Sideways/Bearish/Strong Bearish",
+    "operation_advice": "Strong Buy/Buy/Add/Hold/Reduce/Sell/Watch",
+    "decision_type": "buy/hold/sell",
+    "confidence_level": "High/Medium/Low",
+
+    "dashboard": {
+        "core_conclusion": {
+            "one_sentence": "One-line decision (<=30 words)",
+            "signal_type": "🟢Buy/🟡Hold/🔴Sell/⚠️Risk",
+            "time_sensitivity": "Immediate/Today/This Week/Not Urgent",
+            "position_advice": {
+                "no_position": "Action for no-position users",
+                "has_position": "Action for existing holders"
+            }
+        },
+
+        "data_perspective": {
+            "trend_status": {
+                "ma_alignment": "MA alignment description",
+                "is_bullish": true/false,
+                "trend_score": 0-100
+            },
+            "price_position": {
+                "current_price": number,
+                "ma5": number,
+                "ma10": number,
+                "ma20": number,
+                "bias_ma5": number,
+                "bias_status": "Safe/Caution/Danger",
+                "support_level": number,
+                "resistance_level": number
+            },
+            "volume_analysis": {
+                "volume_ratio": number,
+                "volume_status": "Expansion/Contraction/Normal",
+                "turnover_rate": number,
+                "volume_meaning": "Interpretation"
+            },
+            "chip_structure": {
+                "profit_ratio": number,
+                "avg_cost": number,
+                "concentration": number,
+                "chip_health": "Healthy/Neutral/Caution"
+            }
+        },
+
+        "intelligence": {
+            "latest_news": "Key recent news summary",
+            "risk_alerts": ["Risk 1", "Risk 2"],
+            "positive_catalysts": ["Catalyst 1", "Catalyst 2"],
+            "earnings_outlook": "Earnings outlook",
+            "sentiment_summary": "One-line sentiment summary"
+        },
+
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": "Ideal buy price",
+                "secondary_buy": "Secondary buy price",
+                "stop_loss": "Stop-loss level",
+                "take_profit": "Target level"
+            },
+            "position_strategy": {
+                "suggested_position": "Suggested position size",
+                "entry_plan": "Entry plan",
+                "risk_control": "Risk control plan"
+            },
+            "action_checklist": [
+                "✅/⚠️/❌ Check 1",
+                "✅/⚠️/❌ Check 2",
+                "✅/⚠️/❌ Check 3",
+                "✅/⚠️/❌ Check 4",
+                "✅/⚠️/❌ Check 5",
+                "✅/⚠️/❌ Check 6"
+            ]
+        }
+    },
+
+    "analysis_summary": "~100-word summary",
+    "key_points": "3-5 key points, comma-separated",
+    "risk_warning": "Risk warning",
+    "buy_reason": "Decision rationale",
+
+    "trend_analysis": "Trend analysis",
+    "short_term_outlook": "1-3 day outlook",
+    "medium_term_outlook": "1-2 week outlook",
+    "technical_analysis": "Technical analysis",
+    "ma_analysis": "Moving average analysis",
+    "volume_analysis": "Volume analysis",
+    "pattern_analysis": "Candle/pattern analysis",
+    "fundamental_analysis": "Fundamental analysis",
+    "sector_position": "Sector/industry position",
+    "company_highlights": "Company highlights/risks",
+    "news_summary": "News summary",
+    "market_sentiment": "Market sentiment",
+    "hot_topics": "Related hot topics",
+
+    "search_performed": true/false,
+    "data_sources": "Data sources"
+}
+```
+
+All monetary values must be in **USD**.
+
+## Scoring Guidelines
+
+### Strong Buy (80-100)
+- ✅ MA5 > MA10 > MA20
+- ✅ Bias < 2%
+- ✅ Healthy volume confirmation
+- ✅ Tight positioning
+- ✅ Positive catalysts
+
+### Buy (60-79)
+- ✅ Bullish alignment or mild bullish
+- ✅ Bias < 5%
+- ✅ Normal volume
+- ⚪ One minor condition may be missing
+
+### Watch (40-59)
+- ⚠️ Bias > 5% (chase risk)
+- ⚠️ MAs tangled / unclear trend
+- ⚠️ Risk events present
+
+### Sell/Reduce (0-39)
+- ❌ Bearish alignment
+- ❌ Break below MA20
+- ❌ Heavy sell-off volume
+- ❌ Major negative catalysts
+
+## Decision Dashboard Principles
+1. **Core conclusion first** — one sentence, direct action
+2. **Separate advice for holders vs non-holders**
+3. **Precise levels** — give concrete prices
+4. **Checklist visual** — use ✅⚠️❌
+5. **Risk priority** — make risks prominent
+"""
+
     def __init__(self, api_key: Optional[str] = None):
         """Initialize LLM Analyzer via LiteLLM.
 
@@ -693,6 +880,13 @@ class GeminiAnalyzer:
         self._init_litellm()
         if not self._litellm_available:
             logger.warning("No LLM configured (LITELLM_MODEL / API keys), AI analysis will be unavailable")
+
+    def _is_english(self) -> bool:
+        config = get_config()
+        return str(getattr(config, "output_language", "zh")).lower().startswith("en")
+
+    def _get_system_prompt(self) -> str:
+        return self.SYSTEM_PROMPT_EN if self._is_english() else self.SYSTEM_PROMPT
 
     def _has_channel_config(self, config: Config) -> bool:
         """Check if multi-channel config (channels / YAML / legacy model_list) is active."""
@@ -801,7 +995,7 @@ class GeminiAnalyzer:
                 call_kwargs: Dict[str, Any] = {
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "system", "content": self._get_system_prompt()},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": temperature,
@@ -1051,6 +1245,9 @@ class GeminiAnalyzer:
             name: 股票名称（默认值，可能被上下文覆盖）
             news_context: 预先搜索的新闻内容
         """
+        if self._is_english():
+            return self._format_prompt_en(context, name, news_context)
+
         code = context.get('code', 'Unknown')
         
         # 优先使用上下文中的股票名称（从 realtime_quote 获取）
@@ -1231,10 +1428,196 @@ class GeminiAnalyzer:
         
         return prompt
     
+    def _format_prompt_en(
+        self,
+        context: Dict[str, Any],
+        name: str,
+        news_context: Optional[str] = None,
+    ) -> str:
+        """Format analysis prompt in English (Decision Dashboard)."""
+        code = context.get('code', 'Unknown')
+        stock_name = context.get('stock_name', name)
+        if not stock_name or stock_name == f'Stock {code}':
+            stock_name = STOCK_NAME_MAP.get(code, f'Stock {code}')
+
+        today = context.get('today', {})
+        currency = getattr(get_config(), 'output_currency', 'USD')
+
+        prompt = f"""# Decision Dashboard Analysis Request
+
+## Stock Basics
+| Item | Value |
+|------|------|
+| Ticker | **{code}** |
+| Name | **{stock_name}** |
+| Date | {context.get('date', 'Unknown')} |
+| Currency | {currency} |
+
+---
+
+## Technical Data
+
+### Today's Market Data
+| Metric | Value |
+|------|------|
+| Close | {today.get('close', 'N/A')} {currency} |
+| Open | {today.get('open', 'N/A')} {currency} |
+| High | {today.get('high', 'N/A')} {currency} |
+| Low | {today.get('low', 'N/A')} {currency} |
+| Change | {today.get('pct_chg', 'N/A')}% |
+| Volume | {self._format_volume(today.get('volume'))} |
+| Turnover | {self._format_amount(today.get('amount'))} |
+
+### Moving Averages (Key Trend Signal)
+| MA | Value | Note |
+|------|------|------|
+| MA5 | {today.get('ma5', 'N/A')} | Short-term |
+| MA10 | {today.get('ma10', 'N/A')} | Short/medium |
+| MA20 | {today.get('ma20', 'N/A')} | Medium-term |
+| MA Structure | {context.get('ma_status', 'Unknown')} | Bullish/Bearish/Tangled |
+"""
+
+        if 'realtime' in context:
+            rt = context['realtime']
+            prompt += f"""
+### Real-time Enhancements
+| Metric | Value | Note |
+|------|------|------|
+| Price | {rt.get('price', 'N/A')} {currency} | |
+| **Volume Ratio** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
+| **Turnover Rate** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| PE (TTM) | {rt.get('pe_ratio', 'N/A')} | |
+| PB | {rt.get('pb_ratio', 'N/A')} | |
+| Market Cap | {self._format_amount(rt.get('total_mv'))} | |
+| Float Cap | {self._format_amount(rt.get('circ_mv'))} | |
+| 60D Change | {rt.get('change_60d', 'N/A')}% | Mid-term |
+"""
+
+        if 'chip' in context:
+            chip = context['chip']
+            profit_ratio = chip.get('profit_ratio', 0)
+            prompt += f"""
+### Positioning / Chip Structure
+| Metric | Value | Healthy Range |
+|------|------|----------|
+| **Profit Ratio** | **{profit_ratio:.1%}** | Caution above 70-90% |
+| Avg Cost | {chip.get('avg_cost', 'N/A')} {currency} | Price 5-15% above avg cost is healthy |
+| 90% Concentration | {chip.get('concentration_90', 0):.2%} | <15% is tight |
+| 70% Concentration | {chip.get('concentration_70', 0):.2%} | |
+| Positioning Status | {chip.get('chip_status', 'Unknown')} | |
+"""
+
+        if 'trend_analysis' in context:
+            trend = context['trend_analysis']
+            bias_warning = "🚨 Over 5% — do not chase" if trend.get('bias_ma5', 0) > 5 else "✅ Safe"
+            prompt += f"""
+### Trend Pre-Assessment
+| Metric | Value | Note |
+|------|------|------|
+| Trend Status | {trend.get('trend_status', 'Unknown')} | |
+| MA Alignment | {trend.get('ma_alignment', 'Unknown')} | MA5>MA10>MA20 = bullish |
+| Trend Strength | {trend.get('trend_strength', 0)}/100 | |
+| **Bias vs MA5** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
+| Bias vs MA10 | {trend.get('bias_ma10', 0):+.2f}% | |
+| Volume Status | {trend.get('volume_status', 'Unknown')} | {trend.get('volume_trend', '')} |
+| System Signal | {trend.get('buy_signal', 'Unknown')} | |
+| System Score | {trend.get('signal_score', 0)}/100 | |
+
+#### System Reasons
+**Buy Reasons**:
+{chr(10).join('- ' + r for r in trend.get('signal_reasons', ['None'])) if trend.get('signal_reasons') else '- None'}
+
+**Risk Factors**:
+{chr(10).join('- ' + r for r in trend.get('risk_factors', ['None'])) if trend.get('risk_factors') else '- None'}
+"""
+
+        if 'yesterday' in context:
+            volume_change = context.get('volume_change_ratio', 'N/A')
+            prompt += f"""
+### Price & Volume Change
+- Volume vs yesterday: {volume_change}x
+- Price vs yesterday: {context.get('price_change_ratio', 'N/A')}%
+"""
+
+        prompt += """
+---
+
+## 📰 Intelligence & News
+"""
+        if news_context:
+            prompt += f"""
+Below are the latest 7-day news results for **{stock_name} ({code})**. Please extract:
+1. 🚨 **Risk alerts** (sell-downs, penalties, negative catalysts)
+2. 🎯 **Positive catalysts** (earnings, contracts, policy tailwinds)
+3. 📊 **Earnings outlook** (guidance, filings)
+
+```
+{news_context}
+```
+"""
+        else:
+            prompt += """
+No recent news found. Base your analysis primarily on technical data.
+"""
+
+        if context.get('data_missing'):
+            prompt += """
+⚠️ **Data Missing Warning**
+Some real-time quotes or indicators are unavailable.
+Ignore N/A values above and avoid fabricating data.
+If a technical judgment depends on missing data, state "data unavailable" explicitly.
+"""
+
+        prompt += f"""
+---
+
+## ✅ Analysis Task
+
+Generate a Decision Dashboard JSON for **{stock_name} ({code})**.
+All monetary values must be in **{currency}**.
+"""
+        if context.get('is_index_etf'):
+            prompt += """
+> ⚠️ **Index/ETF Constraints**: This symbol tracks an index or is an ETF.
+> - Risk analysis should focus on index behavior, tracking error, and liquidity
+> - Do not include fund-company lawsuits or management changes
+> - Earnings outlook should be based on index constituents
+"""
+
+        prompt += f"""
+### Important: Stock Name Format
+Use "Company Name ({code})". If name is unknown or incorrect, output the correct English full name at the top.
+
+### Must Answer Clearly
+1. Is MA5>MA10>MA20 bullish alignment satisfied?
+2. Is bias within the safe range (<5%)? If >5%, mark as **do not chase**
+3. Is volume confirming (pullback / breakout)?
+4. Is positioning healthy?
+5. Any major negative news?
+
+### Decision Dashboard Requirements
+- **Core conclusion**: one-line action
+- **Position-based advice**: no-position vs holder
+- **Precise price levels**: entry, stop, target
+- **Checklist**: ✅/⚠️/❌ for each item
+
+Return **only** valid JSON.
+"""
+
+        return prompt
+
     def _format_volume(self, volume: Optional[float]) -> str:
         """格式化成交量显示"""
         if volume is None:
             return 'N/A'
+        if self._is_english():
+            if volume >= 1e9:
+                return f"{volume / 1e9:.2f}B shares"
+            if volume >= 1e6:
+                return f"{volume / 1e6:.2f}M shares"
+            if volume >= 1e3:
+                return f"{volume / 1e3:.2f}K shares"
+            return f"{volume:.0f} shares"
         if volume >= 1e8:
             return f"{volume / 1e8:.2f} 亿股"
         elif volume >= 1e4:
@@ -1246,6 +1629,18 @@ class GeminiAnalyzer:
         """格式化成交额显示"""
         if amount is None:
             return 'N/A'
+        if self._is_english():
+            currency = getattr(get_config(), 'output_currency', 'USD')
+            symbol = '$' if currency == 'USD' else f"{currency} "
+            if amount >= 1e12:
+                return f"{symbol}{amount / 1e12:.2f}T"
+            if amount >= 1e9:
+                return f"{symbol}{amount / 1e9:.2f}B"
+            if amount >= 1e6:
+                return f"{symbol}{amount / 1e6:.2f}M"
+            if amount >= 1e3:
+                return f"{symbol}{amount / 1e3:.2f}K"
+            return f"{symbol}{amount:.0f}"
         if amount >= 1e8:
             return f"{amount / 1e8:.2f} 亿元"
         elif amount >= 1e4:
